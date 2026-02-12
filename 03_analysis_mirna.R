@@ -1,13 +1,12 @@
 #######################################################
-# ANALISI miRNA SEQUENCING - DE, GRAFICI & BIOMARCATORI
-# INPUT: counts/*.tsv, metadata.tsv
-# OUTPUT: CSV, Volcano plot, Heatmap, MDS, UpSet
-# Cartella output: results/
+# ANALISI miRNA QIAseq (UMI-deduplicated)
+# Obiettivo: biomarcatori di prurito
+# Gruppi: SANO, PB, PSO, DA
 #######################################################
 
-# -------------------------
-# Librerie
-# -------------------------
+########################
+# LIBRERIE
+########################
 library(edgeR)
 library(limma)
 library(pheatmap)
@@ -15,208 +14,262 @@ library(EnhancedVolcano)
 library(ggplot2)
 library(UpSetR)
 
-cat("==== INIZIO ANALISI ====\n")
+cat("==== INIZIO ANALISI miRNA QIAseq ====\n")
 
-# -------------------------
-# 1️⃣ Leggi counts e metadata
-# -------------------------
-cat("Leggo counts e metadata...\n")
-files <- list.files("counts", pattern="tsv$", full.names=TRUE)
+########################
+# 1️⃣ LETTURA COUNTS
+########################
+
+cat("Lettura file counts...\n")
+
+files <- list.files("counts",
+                    pattern = "_counts.tsv$",
+                    full.names = TRUE)
+
 if(length(files) == 0){
-  stop("ERROR: nessun file counts trovato in counts/")
+  stop("ERRORE: nessun file trovato in counts/")
 }
 
-counts <- Reduce(function(x,y) merge(x,y,by="miRNA",all=TRUE),
-                 lapply(files, read.delim))
+counts_list <- lapply(files, function(f){
+  df <- read.delim(f, stringsAsFactors = FALSE)
+  colnames(df) <- c("miRNA", basename(f))
+  df
+})
+
+counts <- Reduce(function(x, y) merge(x, y, by = "miRNA", all = TRUE),
+                 counts_list)
+
 rownames(counts) <- counts$miRNA
 counts$miRNA <- NULL
 counts[is.na(counts)] <- 0
 
-meta <- read.delim("metadata.tsv")
+########################
+# 2️⃣ METADATA
+########################
+
+cat("Lettura metadata...\n")
+
+meta <- read.delim("metadata.tsv", stringsAsFactors = FALSE)
+
 if(!all(meta$sample %in% colnames(counts))){
-  stop("ERROR: nomi dei campioni in metadata.tsv non corrispondono ai file counts")
+  stop("ERRORE: metadata non corrisponde ai file counts")
 }
+
 counts <- counts[, meta$sample]
-group <- factor(meta$condition)
 
-# -------------------------
-# 2️⃣ Creazione cartella results
-# -------------------------
-dir.create("results", showWarnings = FALSE)
-cat("Cartella results/ creata.\n")
+group <- factor(meta$condition,
+                levels = c("SANO", "PB", "PSO", "DA"))
 
-# -------------------------
-# 3️⃣ MDS plot globale
-# -------------------------
-cat("Creazione MDS plot...\n")
-dge <- DGEList(counts=counts, group=group)
-dge <- dge[filterByExpr(dge), , keep.lib.sizes=FALSE]
+########################
+# (OPZIONALE) BATCH
+########################
+# Se hai batch di sequenziamento / preparazione
+# scommenta queste righe e aggiungi la colonna "batch" a metadata.tsv
+
+# batch <- factor(meta$batch)
+
+########################
+# 3️⃣ OGGETTO DGE
+########################
+
+dge <- DGEList(counts = counts, group = group)
+
+# filtro espressione bassa
+dge <- dge[filterByExpr(dge), , keep.lib.sizes = FALSE]
+
+# normalizzazione TMM
 dge <- calcNormFactors(dge)
 
-png("results/MDS_all_samples.png", width=800, height=600)
-plotMDS(dge,
-        col = as.numeric(group),
-        pch = 16,
-        main = "MDS plot – miRNA expression")
-legend("topright",
-       legend = levels(group),
-       col = seq_along(levels(group)),
-       pch = 16)
+########################
+# 4️⃣ CARTELLE OUTPUT
+########################
+
+dir.create("results", showWarnings = FALSE)
+dir.create("results/plots", showWarnings = FALSE)
+
+########################
+# 5️⃣ PCA & MDS
+########################
+
+cat("PCA e MDS...\n")
+
+logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+
+# PCA
+pca <- prcomp(t(logCPM), scale. = TRUE)
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  Condition = group
+)
+
+ggplot(pca_df, aes(PC1, PC2, color = Condition)) +
+  geom_point(size = 4) +
+  theme_minimal() +
+  labs(title = "PCA – miRNA expression",
+       subtitle = "QIAseq UMI-deduplicated",
+       x = "PC1", y = "PC2")
+
+ggsave("results/plots/PCA_all_samples.png", width = 7, height = 6)
+
+# MDS
+png("results/plots/MDS_all_samples.png", width = 800, height = 600)
+plotMDS(dge, col = as.numeric(group), pch = 16,
+        main = "MDS – miRNA expression")
+legend("topright", legend = levels(group),
+       col = seq_along(levels(group)), pch = 16)
 dev.off()
 
-# -------------------------
-# 4️⃣ Linear model + voom
-# -------------------------
-cat("Calcolo DE singole patologie...\n")
-design <- model.matrix(~0+group)
+########################
+# 6️⃣ MODELLO LINEARE (voom)
+########################
+
+cat("Modello lineare...\n")
+
+design <- model.matrix(~0 + group)
 colnames(design) <- levels(group)
+
+# se usi batch:
+# design <- model.matrix(~0 + group + batch)
 
 v <- voomWithQualityWeights(dge, design)
 fit <- lmFit(v, design)
 
+########################
+# 7️⃣ CONTRASTI
+########################
+
 contrasts <- makeContrasts(
-  DA_vs_CTRL = atopic_dermatitis - control,
-  PB_vs_CTRL = pemphigoid - control,
-  PSO_vs_CTRL = psoriasis - control,
-  levels=design
+  PB_vs_SANO  = PB  - SANO,
+  PSO_vs_SANO = PSO - SANO,
+  DA_vs_SANO  = DA  - SANO,
+  levels = design
 )
+
 fit2 <- contrasts.fit(fit, contrasts)
 fit2 <- eBayes(fit2)
 
-# -------------------------
-# 5️⃣ Salva risultati singoli + grafici
-# -------------------------
+########################
+# 8️⃣ RISULTATI DE + PLOT
+########################
+
 contrast_list <- list(
-  "DA_vs_CTRL" = topTable(fit2, coef=1, number=Inf),
-  "PB_vs_CTRL" = topTable(fit2, coef=2, number=Inf),
-  "PSO_vs_CTRL" = topTable(fit2, coef=3, number=Inf)
+  PB_vs_SANO  = "PB_vs_SANO",
+  PSO_vs_SANO = "PSO_vs_SANO",
+  DA_vs_SANO  = "DA_vs_SANO"
 )
 
-cat("Salvo CSV e generazione grafici per confronti singoli...\n")
 for(name in names(contrast_list)){
-  res <- contrast_list[[name]]
+  
+  res <- topTable(fit2,
+                  coef = contrast_list[[name]],
+                  number = Inf,
+                  sort.by = "P")
+  
   write.csv(res, paste0("results/", name, ".csv"))
   
-  # Volcano plot
+  # Volcano
   EnhancedVolcano(res,
                   lab = rownames(res),
                   x = "logFC",
                   y = "adj.P.Val",
                   pCutoff = 0.05,
                   FCcutoff = 1,
-                  title = paste0(name, " Volcano"),
-                  subtitle = "Differential miRNA expression",
+                  title = name,
+                  subtitle = "miRNA biomarkers",
                   caption = "FDR < 0.05")
-  ggsave(paste0("results/Volcano_", name, ".png"), width=8, height=6)
   
-  # Heatmap top 30 DE miRNA
-  top_mirna <- rownames(res[res$adj.P.Val < 0.05, ])
-  top_mirna <- head(top_mirna, 30)
-  if(length(top_mirna) >= 2){
-    expr <- v$E[top_mirna, ]
+  ggsave(paste0("results/plots/Volcano_", name, ".png"),
+         width = 8, height = 6)
+  
+  # Heatmap top 30
+  sig <- rownames(res[res$adj.P.Val < 0.05, ])
+  sig <- head(sig, 30)
+  
+  if(length(sig) >= 2){
+    expr <- v$E[sig, ]
     annotation_col <- data.frame(Condition = group)
     rownames(annotation_col) <- colnames(expr)
     
     pheatmap(expr,
-             scale="row",
-             annotation_col=annotation_col,
-             show_colnames=FALSE,
-             main=paste0("Top DE miRNA – ", name))
-    ggsave(paste0("results/Heatmap_top30_", name, ".png"), width=8, height=6)
+             scale = "row",
+             annotation_col = annotation_col,
+             show_colnames = FALSE,
+             main = paste("Top miRNA –", name))
+    
+    ggsave(paste0("results/plots/Heatmap_", name, ".png"),
+           width = 8, height = 6)
   }
 }
 
-# -------------------------
-# 6️⃣ Confronto globale: tutti i malati vs sani
-# -------------------------
-cat("Calcolo DE globale: tutti i malati vs CTRL...\n")
-meta$phenotype <- ifelse(meta$condition=="control", "control", "disease")
-meta$phenotype <- factor(meta$phenotype)
-group2 <- meta$phenotype
+########################
+# 9️⃣ FIRMA GLOBALE PRURITO
+########################
 
-dge2 <- DGEList(counts=counts, group=group2)
-dge2 <- dge2[filterByExpr(dge2), , keep.lib.sizes=FALSE]
+cat("Analisi globale PRURITUS vs SANO...\n")
+
+meta$phenotype <- ifelse(meta$condition == "SANO",
+                         "SANO", "PRURITUS")
+group2 <- factor(meta$phenotype,
+                 levels = c("SANO", "PRURITUS"))
+
+dge2 <- DGEList(counts = counts, group = group2)
+dge2 <- dge2[filterByExpr(dge2), , keep.lib.sizes = FALSE]
 dge2 <- calcNormFactors(dge2)
 
 design2 <- model.matrix(~0 + group2)
 colnames(design2) <- levels(group2)
 
 v2 <- voomWithQualityWeights(dge2, design2)
-fit2b <- lmFit(v2, design2)
+fit_pru <- lmFit(v2, design2)
 
-contrast2 <- makeContrasts(DISEASE_vs_CTRL = disease - control,
-                           levels=design2)
-fit2b <- contrasts.fit(fit2b, contrast2)
-fit2b <- eBayes(fit2b)
+contrast2 <- makeContrasts(
+  PRURITUS_vs_SANO = PRURITUS - SANO,
+  levels = design2
+)
 
-res_disease <- topTable(fit2b, number=Inf)
-write.csv(res_disease, "results/DISEASE_vs_CTRL.csv")
+fit_pru <- contrasts.fit(fit_pru, contrast2)
+fit_pru <- eBayes(fit_pru)
 
-EnhancedVolcano(res_disease,
-                lab = rownames(res_disease),
+res_pruritus <- topTable(fit_pru, number = Inf)
+write.csv(res_pruritus, "results/PRURITUS_vs_SANO.csv")
+
+EnhancedVolcano(res_pruritus,
+                lab = rownames(res_pruritus),
                 x = "logFC",
                 y = "adj.P.Val",
                 pCutoff = 0.05,
                 FCcutoff = 1,
-                title = "All diseases vs Control",
-                subtitle = "Shared pruritus-associated miRNAs")
-ggsave("results/Volcano_DISEASE_vs_CTRL.png", width=8, height=6)
+                title = "Pruritus miRNA signature")
 
-top_shared <- rownames(res_disease[res_disease$adj.P.Val < 0.05, ])
-top_shared <- head(top_shared, 30)
-if(length(top_shared) >= 2){
-  expr2 <- v2$E[top_shared, ]
-  annotation_col <- data.frame(Phenotype = group2)
-  rownames(annotation_col) <- colnames(expr2)
-  
-  pheatmap(expr2,
-           scale="row",
-           annotation_col=annotation_col,
-           show_colnames=FALSE,
-           main="Top shared miRNAs – Disease vs Control")
-  ggsave("results/Heatmap_shared_miRNA.png", width=8, height=6)
-}
+ggsave("results/plots/Volcano_PRURITUS_vs_SANO.png",
+       width = 8, height = 6)
 
-# -------------------------
-# 7️⃣ UpSet plot
-# -------------------------
-cat("Creazione UpSet plot...\n")
-sig_DA <- rownames(topTable(fit2, coef=1, number=Inf)[topTable(fit2, coef=1, number=Inf)$adj.P.Val<0.05,])
-sig_PB <- rownames(topTable(fit2, coef=2, number=Inf)[topTable(fit2, coef=2, number=Inf)$adj.P.Val<0.05,])
-sig_PSO <- rownames(topTable(fit2, coef=3, number=Inf)[topTable(fit2, coef=3, number=Inf)$adj.P.Val<0.05,])
+########################
+# 🔟 UPSET PLOT
+########################
 
-mir_list <- list("DA"=sig_DA, "PB"=sig_PB, "PSO"=sig_PSO)
+sig_PB  <- rownames(subset(
+  topTable(fit2, coef="PB_vs_SANO", number=Inf),
+  adj.P.Val < 0.05))
 
-png("results/UpSet_miRNA.png", width=1000, height=800)
-upset(fromList(mir_list),
-      order.by="freq",
-      main.bar.color="darkblue",
-      sets.bar.color="steelblue",
-      text.scale=c(2,2,1.5,1.5,1.5,1.5))
+sig_PSO <- rownames(subset(
+  topTable(fit2, coef="PSO_vs_SANO", number=Inf),
+  adj.P.Val < 0.05))
+
+sig_DA  <- rownames(subset(
+  topTable(fit2, coef="DA_vs_SANO", number=Inf),
+  adj.P.Val < 0.05))
+
+png("results/plots/UpSet_miRNA_pruritus.png",
+    width = 1000, height = 800)
+
+upset(fromList(list(
+  PB  = sig_PB,
+  PSO = sig_PSO,
+  DA  = sig_DA)),
+  order.by = "freq")
+
 dev.off()
 
-# -------------------------
-# 8️⃣ Identificazione miRNA candidati biomarcatori di prurito
-# -------------------------
-cat("Selezione automatica dei biomarcatori di prurito...\n")
-sig_global <- rownames(res_disease[res_disease$adj.P.Val < 0.05, ])
-sig_shared <- Reduce(intersect, list(sig_DA, sig_PB, sig_PSO))
-pruritus_biomarkers <- intersect(sig_global, sig_shared)
-
-biomarker_table <- data.frame(miRNA = pruritus_biomarkers)
-write.csv(biomarker_table, "results/miRNA_pruritus_biomarkers.csv", row.names=FALSE)
-
-if(length(pruritus_biomarkers) >= 2){
-  expr_biom <- v2$E[pruritus_biomarkers, ]
-  annotation_col <- data.frame(Phenotype = group2)
-  rownames(annotation_col) <- colnames(expr_biom)
-  
-  pheatmap(expr_biom,
-           scale="row",
-           annotation_col=annotation_col,
-           show_colnames=FALSE,
-           main="Candidate pruritus miRNAs")
-  ggsave("results/Heatmap_pruritus_biomarkers.png", width=8, height=6)
-}
-
-cat("==== ANALISI COMPLETA! Tutti i file in results/ ====\n")
+cat("==== FINE ANALISI miRNA QIAseq ====\n")
