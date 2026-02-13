@@ -32,12 +32,19 @@ R -e 'BiocManager::install(c("edgeR","limma","pheatmap","EnhancedVolcano","UpSet
 
 # reference miRNA (mirBASE)
 
-wget https://mirbase.org/download/mature.fa
-wget https://mirbase.org/download/hairpins.fa
+wget https://mirbase.org/download/mature.fa.gz
 
 # https://www.mirbase.org/download/ #
 
-cat mature.fa hairpins.fa > hsa_mature.fa          # concateno i 2 file (miRNA maturi e hairpins)
+wget https://mirgenedb.org/fasta/ALL?mat=1
+
+# https://mirgenedb.org/download
+
+wget https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz
+
+# https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz
+
+####################################
 
 # solo Homo sapiens
 grep -A1 "^>hsa-" hsa_mature.fa > hsa_miRNA.fa
@@ -48,12 +55,16 @@ grep -A1 "^>hsa-" hsa_mature.fa > hsa_miRNA.fa
 
 bowtie-build hsa_miRNA.fa hsa_miRNA
 
+bowtie-build hsa_mature.fas hsa_miRNA_MirGeneDB
+
+bowtie-build GRCh38_latest_genomic.fna hsa_miRNA_NCBI_GRCh38
+
 ###################################
 ###################################
 # VARIABILI
 ###################################
 
-THREADS=16
+THREADS=30
 
 RAW=raw_data
 TRIM=trimmed
@@ -62,6 +73,10 @@ COUNT=counts
 LOGS=logs
 
 REF_IDX=/home/user/reference/hsa_miRNA
+
+REF_IDX=/home/user/reference/hsa_miRNA_MirGeneDB
+
+REF_IDX=/home/user/reference/hsa_miRNA_NCBI_GRCh38
 
 ###################################
 ##### ADAPTER QIAseq miRNA #####
