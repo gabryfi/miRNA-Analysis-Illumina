@@ -1,53 +1,29 @@
 # the references build from .gtf file
 
-
-##########
-# OPTIONAL: separazione reads mapped / unmapped
-#########
-
-for sam in $ALIGN/*_article.sam; do
-  base=$(basename "$sam" _article.sam)
-
-  # Estrae le reads mappate
-  bowtie --sam --all "$sam" > "$ALIGN/${base}_mapped.fastq"
-
-  # Estrae le reads non mappate
-  bowtie --sam --un "$sam" > "$ALIGN/${base}_unmapped.fastq"
-done
-
-# http://hgdownload.cse.ucsc.edu/downloads.html
-
 ###################################
-# CONVERSIONE BAM
+# 1️⃣ Conversione SAM -> BAM ordinato
 ###################################
-
 for sam in $ALIGN/*.sam; do
-  # Estrai il nome base del file senza percorso e estensione
   base=$(basename "$sam" .sam)
 
-  # Converte SAM in BAM binario e ordina per coordinate
-  samtools view -bS "$sam" | \
-  samtools sort -@ $THREADS -o "$ALIGN/${base}.sorted.bam"
+  # Converte SAM in BAM e ordina per coordinate
+  samtools view -bS "$sam" \
+    | samtools sort -@ $THREADS -o "$ALIGN/${base}.sorted.bam"
 
-  # Crea indice .bai per accesso veloce al BAM
+  # Crea indice BAM per accesso rapido
   samtools index "$ALIGN/${base}.sorted.bam"
-
 done
 
 ###################################
-# UMI DEDUPLICATION + GENE COUNT
+# 2️⃣ UMI DEDUPLICATION + gene/miRNA count
 ###################################
-
 for bam in $ALIGN/*.sorted.bam; do
-  # Estrai il nome base del file BAM senza estensione
   base=$(basename "$bam" .sorted.bam)
 
   umi_tools count \
-    --per-gene \                     # Conta le reads raggruppandole per gene/miRNA
-    --gene-tag=XT \                   # Indica il tag BAM dove è annotato il gene/miRNA (XT è il tag usato in bowtie o GTF)
-    --assigned-status-tag=XS \        # Usa il tag XS per determinare se la read è stata assegnata al gene correttamente
-    -I "$bam" \                       # Input BAM ordinato dal passo precedente
-    -S "$COUNT/${base}_counts.tsv" \  # Output: tabella dei conteggi per ogni gene/miRNA
-    --log="$LOGS/${base}_umi_count.log"  # Log dettagliato del processo
+    --per-gene \                    # Conta le reads raggruppandole per gene/miRNA
+    --gene-tag=gene_id \            # Usa il campo gene_id dal GTF
+    -I "$bam" \                     # Input BAM ordinato
+    -S "$COUNT/${base}_counts.tsv" \# Output: tabella conteggi pronta per DESeq2
+    --log="$LOGS/${base}_umi_count.log"
 done
-
