@@ -1,0 +1,37 @@
+# riferimenti GTF 
+
+REF_GTF="/home/user/reference/"  # GRCh38
+
+REF_GTF="/home/user/reference/hsa_miRBase.gtf"       # miRBase
+
+REF_GTF="/home/user/reference/MirGeneDB.gtf"         # MirGeneDB
+
+###################################
+# CONVERSIONE SAM -> BAM ORDINATO
+###################################
+for sam in $ALIGN/*.sam; do
+  base=$(basename "$sam" .sam)
+
+  echo "Processing $sam -> BAM ordinato"
+  samtools view -bS "$sam" \
+    | samtools sort -@ $THREADS -o "$ALIGN/${base}.sorted.bam"
+
+  samtools index "$ALIGN/${base}.sorted.bam"
+done
+
+###################################
+# CONTEGGIO miRNA con featureCounts
+###################################
+for bam in $ALIGN/*.sorted.bam; do
+  base=$(basename "$bam" .sorted.bam)
+
+  echo "Counting miRNA in $bam"
+  featureCounts \
+    -t transcript \        # nel GTF convertito ogni transcript corrisponde a un miRNA
+    -g gene_id \            # legge l'attributo gene_id
+    -a "$REF_GTF" \         # file GTF di riferimento
+    -o "$COUNT/${base}_counts.txt" \
+    "$bam"
+done
+
+echo "Pipeline completata, i file di conteggio sono in $COUNT"
