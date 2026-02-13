@@ -29,8 +29,8 @@ for fq in $TRIM/*.trimmed.fastq.gz; do
   base=$(basename "$fq" .trimmed.fastq.gz)
 
   bowtie \
-    -v 2 \                        # Permette fino a 2 mismatch nella mappatura
-    -k 10 \                       # Riporta fino a 10 posizioni per reads multimappanti
+    -v 1 \                         # Permette fino a 1 mismatch nella mappatura
+    -k 1 \                         # Riporta fino a n posizioni per reads multimappanti (1 reads= + loci) !!! attenzione DUPLICATI (1 read conta più volte)
     --best \                       # Restituisce solo l'allineamento migliore
     --strata \                     # Seleziona l'allineamento migliore in termini di score
     -p $THREADS \                  # Numero di thread per parallelizzare l'analisi
@@ -49,9 +49,9 @@ for fq in $TRIM/*.trimmed.fastq.gz; do
   base=$(basename "$fq" .trimmed.fastq.gz)
 
   bowtie \
-    -v 1 \                        # Permette solo 1 mismatch per read, più stringente
-    -m 20 \                        # Riporta fino a 20 posizioni se read multimappante
-    --best \                        # Restituisce l’allineamento con miglior punteggio
+    -v 1 \                           # Permette solo 1 mismatch per read, più stringente
+    -m 1 \                           # Riporta fino a n posizioni se read multimappante
+    --best \                         # Restituisce l’allineamento con miglior punteggio
     --strata \                       # Assicura che solo l’allineamento migliore sia restituito
     -p $THREADS \                    # Parallelizza il mapping
     $REF_IDX \                       # Indice Bowtie creato dal reference genome + miRNA/ncRNA combinati
