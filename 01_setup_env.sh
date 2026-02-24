@@ -84,7 +84,8 @@ REF_IDX=/home/user/reference/hsa_miRNA_NCBI_GRCh38
 ##### E MODIFICA QUI !!!!! #####
 ###################################
 
-ADAPTER="INSERISCI_QUI_ADAPTER_QIASEQ_CORRETTO" ################################################################################
+ADAPTER=AACTGTAGGCACCATCAAT
+ ################################################################################
 
 mkdir -p fastqc $TRIM $ALIGN $COUNT $LOGS
 
