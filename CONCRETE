@@ -1,0 +1,262 @@
+############################################
+# AMBIENTE
+############################################
+
+conda create -n mirna_qiaseq -y
+conda activate mirna_qiaseq
+
+conda install -y -c bioconda \
+  fastqc \
+  cutadapt \
+  bowtie \
+  samtools \
+  subread \
+  umi_tools
+
+conda install -y -c conda-forge pigz
+
+
+############################################
+# VARIABILI PROGETTO
+############################################
+
+PROJECT=/home/user/mirna_project
+
+RAW=$PROJECT/raw
+COMMON=$PROJECT/common
+REF=$PROJECT/references
+RESULTS=$PROJECT/results
+
+THREADS=30
+
+ADAPTER_3P=AACTGTAGGCACCATCAAT
+ADAPTER_5P=GTTCAGAGTTCTACAGTCCGACGATC
+UMI_LENGTH=12
+
+
+############################################
+# CREAZIONE STRUTTURA
+############################################
+
+mkdir -p \
+  $COMMON/fastqc \
+  $COMMON/extracted \
+  $COMMON/trimmed \
+  $COMMON/filtered_rrna \
+  $COMMON/logs \
+  $RESULTS
+
+
+############################################
+# FASTQC
+############################################
+
+find "$RAW" -name "*.fastq.gz" | \
+  xargs fastqc -t $THREADS -o $COMMON/fastqc
+
+
+############################################
+# ESTRAZIONE UMI (12nt 5')
+############################################
+
+find "$RAW" -name "*.fastq.gz" | while read fq; do
+
+  base=$(basename "$fq" .fastq.gz)
+
+  umi_tools extract \
+    --bc-pattern=NNNNNNNNNNNN \
+    --stdin="$fq" \
+    --stdout="$COMMON/extracted/${base}.umi.fastq.gz" \
+    --log="$COMMON/logs/${base}_umi_extract.log"
+
+done
+
+
+############################################
+# TRIMMING 3' E 5' ADAPTER
+############################################
+
+for fq in $COMMON/extracted/*.umi.fastq.gz; do
+
+  base=$(basename "$fq" .umi.fastq.gz)
+
+  cutadapt \
+    -a $ADAPTER_3P \
+    -g $ADAPTER_5P \
+    -e 0.1 \
+    -m 17 -M 30 \
+    --trim-n \
+    -j $THREADS \
+    -o "$COMMON/trimmed/${base}.trimmed.fastq.gz" \
+    "$fq" > "$COMMON/logs/${base}_cutadapt.log"
+
+done
+
+
+############################################
+# RIMOZIONE rRNA / tRNA
+############################################
+# (assicurati di avere references/contaminants/index già creato)
+
+bowtie-build $REF/contaminants/contaminants.fa \
+             $REF/contaminants/index
+
+for fq in $COMMON/trimmed/*.trimmed.fastq.gz; do
+
+  base=$(basename "$fq" .trimmed.fastq.gz)
+
+  bowtie \
+    -v 1 \
+    -k 1 \
+    --best \
+    --strata \
+    --norc \
+    -p $THREADS \
+    --un "$COMMON/filtered_rrna/${base}.clean.fastq" \
+    $REF/contaminants/index \
+    "$fq" \
+    > /dev/null
+
+  pigz "$COMMON/filtered_rrna/${base}.clean.fastq"
+
+done
+
+
+############################################
+# INDICIZZAZIONE DATABASE
+############################################
+
+bowtie-build $REF/miRBase/hsa_miRNA.fa $REF/miRBase/index
+bowtie-build $REF/MirGeneDB/hsa_mature.fa $REF/MirGeneDB/index
+bowtie-build $REF/GRCh38/genome.fa $REF/GRCh38/index
+
+
+############################################
+# ANALISI PER DATABASE
+############################################
+
+for DB in miRBase MirGeneDB GRCh38; do
+
+  echo "======================================"
+  echo "Running pipeline for $DB"
+  echo "======================================"
+
+  case $DB in
+    miRBase)
+      REF_IDX="$REF/miRBase/index"
+      REF_GTF="$REF/miRBase/hsa_miRBase.gtf"
+      MIRNA_MODE=1
+      ;;
+    MirGeneDB)
+      REF_IDX="$REF/MirGeneDB/index"
+      REF_GTF="$REF/MirGeneDB/MirGeneDB.gtf"
+      MIRNA_MODE=1
+      ;;
+    GRCh38)
+      REF_IDX="$REF/GRCh38/index"
+      REF_GTF="$REF/GRCh38/GRCh38.gtf"
+      MIRNA_MODE=0
+      ;;
+  esac
+
+  ALIGN="$RESULTS/$DB/alignment"
+  COUNT="$RESULTS/$DB/counts"
+
+  mkdir -p $ALIGN $COUNT
+
+
+  ############################################
+  # ALIGNMENT UNIVOCO
+  ############################################
+
+  for fq in $COMMON/filtered_rrna/*.clean.fastq.gz; do
+
+    base=$(basename "$fq" .clean.fastq.gz)
+
+    if [ $MIRNA_MODE -eq 1 ]; then
+      bowtie \
+        -v 1 \
+        -m 1 \
+        --best \
+        --strata \
+        --norc \
+        --nomaqround \
+        -p $THREADS \
+        $REF_IDX \
+        "$fq" \
+        "$ALIGN/${base}.sam"
+    else
+      bowtie \
+        -v 1 \
+        -m 1 \
+        --best \
+        --strata \
+        --nomaqround \
+        -p $THREADS \
+        $REF_IDX \
+        "$fq" \
+        "$ALIGN/${base}.sam"
+    fi
+
+  done
+
+
+  ############################################
+  # SAM → BAM ORDINATO
+  ############################################
+
+  for sam in $ALIGN/*.sam; do
+
+    base=$(basename "$sam" .sam)
+
+    samtools view -bS "$sam" | \
+      samtools sort -@ $THREADS -o "$ALIGN/${base}.sorted.bam"
+
+    samtools index "$ALIGN/${base}.sorted.bam"
+
+    rm "$sam"
+
+  done
+
+
+  ############################################
+  # DEDUPLICAZIONE UMI
+  ############################################
+
+  for bam in $ALIGN/*.sorted.bam; do
+
+    base=$(basename "$bam" .sorted.bam)
+
+    umi_tools dedup \
+      -I "$bam" \
+      -S "$ALIGN/${base}.dedup.bam" \
+      --log="$COMMON/logs/${base}_umi_dedup.log"
+
+    samtools index "$ALIGN/${base}.dedup.bam"
+
+  done
+
+
+  ############################################
+  # FEATURECOUNTS (UNIVOCO)
+  ############################################
+
+  for bam in $ALIGN/*.dedup.bam; do
+
+    base=$(basename "$bam" .dedup.bam)
+
+    featureCounts \
+      -T $THREADS \
+      -t transcript \
+      -g gene_id \
+      -a "$REF_GTF" \
+      -o "$COUNT/${base}_counts.txt" \
+      "$bam"
+
+  done
+
+done
+
+
+echo "Pipeline completata: UMI + doppio adapter trimming + decontaminazione + mapping univoco."
+
