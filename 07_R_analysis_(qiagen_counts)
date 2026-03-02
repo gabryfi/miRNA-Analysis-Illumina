@@ -1,0 +1,472 @@
+############################################################
+# DESeq2 miRNA differential expression pipeline (end-to-end)
+# Inputs (in working dir):
+#   1) MATRICE_DESeq2      -> raw count matrix (rows=miRNA, cols=samples)
+#   2) metadata_mirna      -> metadata (rows=samples, cols include 'condition')
+#
+# Outputs (auto-created):
+#   results_DESeq2/
+#     01_QC/
+#     02_DE/ <contrast>/
+#     03_Comparative/
+#     04_Enrichment/ <contrast>/
+#
+# Notes:
+# - counts MUST be raw integer counts (no CPM/TPM/log).
+# - metadata MUST have sample names matching count colnames.
+# - condition must include: SANO, DA, PB, PSO
+############################################################
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+############################
+# User parameters
+############################
+counts_file   <- "MATRICE_DESeq2"
+metadata_file <- "metadata_mirna"
+
+outdir <- "results_DESeq2"
+
+# thresholds for "differentially expressed"
+padj_cutoff <- 0.05
+lfc_cutoff  <- 1
+
+# plots
+topN_heatmap <- 50   # top variable miRNA for global heatmap (QC)
+topN_labels_volcano <- 15
+
+############################
+# Helper functions
+############################
+guess_delim <- function(path) {
+  first <- readLines(path, n = 1, warn = FALSE)
+  if (grepl("\t", first)) return("\t")
+  if (grepl(";", first))  return(";")
+  return(",")
+}
+
+read_table_flexible <- function(path, rownames_col = 1) {
+  delim <- guess_delim(path)
+  # try read.table (tsv/csv) robustly
+  x <- tryCatch(
+    read.table(path, header = TRUE, sep = delim, quote = "", comment.char = "",
+               check.names = FALSE, stringsAsFactors = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(x)) stop("Impossibile leggere il file: ", path)
+
+  # if first col is rownames
+  if (rownames_col > 0) {
+    rn <- x[[rownames_col]]
+    x[[rownames_col]] <- NULL
+    rownames(x) <- rn
+  }
+  return(x)
+}
+
+make_dir <- function(...) {
+  d <- file.path(...)
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  d
+}
+
+save_csv <- function(df, path) {
+  write.csv(df, file = path, quote = TRUE)
+}
+
+volcano_plot <- function(res_df, title, out_png, padj_cutoff, lfc_cutoff, topN = 15) {
+  df <- res_df
+  df$neglog10padj <- -log10(df$padj)
+  df$sig <- "NS"
+  df$sig[df$padj < padj_cutoff & df$log2FoldChange >  lfc_cutoff] <- "UP"
+  df$sig[df$padj < padj_cutoff & df$log2FoldChange < -lfc_cutoff] <- "DOWN"
+
+  # label top by padj among significant
+  lab <- df[df$padj < padj_cutoff & !is.na(df$padj), ]
+  lab <- lab[order(lab$padj), , drop = FALSE]
+  lab <- head(lab, topN)
+
+  p <- ggplot(df, aes(x = log2FoldChange, y = neglog10padj)) +
+    geom_point(aes(shape = sig), alpha = 0.7, size = 1.8) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed") +
+    geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed") +
+    labs(title = title, x = "log2(Fold Change)", y = "-log10(adjusted p-value)") +
+    theme_bw()
+
+  if (nrow(lab) > 0) {
+    p <- p + geom_text(
+      data = lab,
+      aes(label = rownames(lab)),
+      vjust = -0.6,
+      size = 3
+    )
+  }
+
+  ggsave(out_png, p, width = 8, height = 6, dpi = 200)
+}
+
+pca_plot <- function(vst_mat, coldata, out_png, title) {
+  pca <- prcomp(t(vst_mat), scale. = FALSE)
+  pc <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+  pc$sample <- rownames(pc)
+  pc$condition <- coldata[pc$sample, "condition"]
+
+  var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+  xlab <- paste0("PC1 (", round(100 * var_expl[1], 1), "%)")
+  ylab <- paste0("PC2 (", round(100 * var_expl[2], 1), "%)")
+
+  p <- ggplot(pc, aes(x = PC1, y = PC2, shape = condition)) +
+    geom_point(size = 3, alpha = 0.9) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_bw()
+
+  ggsave(out_png, p, width = 7, height = 5, dpi = 200)
+}
+
+heatmap_topvar <- function(vst_mat, coldata, out_png, title, topN = 50) {
+  vars <- apply(vst_mat, 1, var)
+  top <- names(sort(vars, decreasing = TRUE))[seq_len(min(topN, length(vars)))]
+  mat <- vst_mat[top, , drop = FALSE]
+
+  ann <- data.frame(condition = coldata$condition)
+  rownames(ann) <- rownames(coldata)
+
+  pheatmap(mat,
+           annotation_col = ann,
+           show_colnames = TRUE,
+           show_rownames = TRUE,
+           fontsize_row = 7,
+           main = title,
+           filename = out_png,
+           width = 9, height = 8)
+}
+
+############################
+# Create output folders
+############################
+qc_dir   <- make_dir(outdir, "01_QC")
+de_dir   <- make_dir(outdir, "02_DE")
+cmp_dir  <- make_dir(outdir, "03_Comparative")
+enr_dir  <- make_dir(outdir, "04_Enrichment")
+
+############################
+# Load inputs
+############################
+counts  <- read_table_flexible(counts_file, rownames_col = 1)
+meta    <- read_table_flexible(metadata_file, rownames_col = 1)
+
+# Basic sanity checks
+if (!"condition" %in% colnames(meta)) {
+  stop("metadata_mirna deve contenere una colonna chiamata 'condition'.")
+}
+
+# Ensure matching sample names
+if (!all(colnames(counts) %in% rownames(meta))) {
+  missing <- setdiff(colnames(counts), rownames(meta))
+  stop("Questi campioni sono presenti nella matrice ma NON nel metadata: ",
+       paste(missing, collapse = ", "))
+}
+
+# Reorder metadata to match counts columns
+meta <- meta[colnames(counts), , drop = FALSE]
+
+# Ensure condition levels & reference
+meta$condition <- factor(meta$condition)
+if (!"SANO" %in% levels(meta$condition)) {
+  stop("Nel metadata non trovo la condizione 'SANO'. Controlla i nomi.")
+}
+meta$condition <- relevel(meta$condition, ref = "SANO")
+
+############################
+# Build DESeq2 object
+############################
+dds <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(counts)),
+  colData   = meta,
+  design    = ~ condition
+)
+
+# Optional filtering: keep features with enough counts
+keep <- rowSums(counts(dds) >= 5) >= 3
+dds <- dds[keep, ]
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# VST for QC plots
+vst_obj <- vst(dds, blind = TRUE)
+vst_mat <- assay(vst_obj)
+
+############################
+# QC outputs
+############################
+# PCA (all samples)
+pca_plot(
+  vst_mat = vst_mat,
+  coldata = meta,
+  out_png = file.path(qc_dir, "PCA_all_samples.png"),
+  title   = "PCA (VST) - Tutti i campioni"
+)
+
+# Heatmap top variable miRNAs (all samples)
+heatmap_topvar(
+  vst_mat = vst_mat,
+  coldata = meta,
+  out_png = file.path(qc_dir, paste0("Heatmap_top", topN_heatmap, "_variable_miRNA.png")),
+  title   = paste0("Heatmap (VST) - top ", topN_heatmap, " miRNA variabili"),
+  topN    = topN_heatmap
+)
+
+############################
+# Differential expression contrasts
+############################
+contrasts <- list(
+  PB_vs_SANO  = c("condition", "PB",  "SANO"),
+  DA_vs_SANO  = c("condition", "DA",  "SANO"),
+  PSO_vs_SANO = c("condition", "PSO", "SANO")
+)
+
+# store significant sets for comparative analyses
+sig_sets <- list()
+
+for (nm in names(contrasts)) {
+  cvec <- contrasts[[nm]]
+  this_dir <- make_dir(de_dir, nm)
+
+  # results
+  res <- results(dds, contrast = cvec)
+  res <- lfcShrink(dds, contrast = cvec, res = res, type = "apeglm")  # better LFC estimates
+
+  res_df <- as.data.frame(res)
+  res_df$miRNA <- rownames(res_df)
+  res_df <- res_df[, c("miRNA", setdiff(colnames(res_df), "miRNA"))]
+
+  # save full results
+  save_csv(res_df, file.path(this_dir, paste0(nm, "_DESeq2_ALL.csv")))
+
+  # significant list
+  sig <- res_df[!is.na(res_df$padj) &
+                  res_df$padj < padj_cutoff &
+                  abs(res_df$log2FoldChange) >= lfc_cutoff, , drop = FALSE]
+  sig <- sig[order(sig$padj), , drop = FALSE]
+  save_csv(sig, file.path(this_dir, paste0(nm, "_DESeq2_SIG_padj", padj_cutoff, "_LFC", lfc_cutoff, ".csv")))
+
+  # store set
+  sig_sets[[nm]] <- sig$miRNA
+
+  # Volcano
+  volcano_plot(
+    res_df = within(res_df, { rownames(res_df) <- miRNA }),
+    title = paste0("Volcano: ", nm, " (padj<", padj_cutoff, ", |LFC|>=", lfc_cutoff, ")"),
+    out_png = file.path(this_dir, paste0("Volcano_", nm, ".png")),
+    padj_cutoff = padj_cutoff,
+    lfc_cutoff  = lfc_cutoff,
+    topN        = topN_labels_volcano
+  )
+
+  # Heatmap of significant miRNAs (if any)
+  if (nrow(sig) >= 2) {
+    mat_sig <- vst_mat[sig$miRNA, , drop = FALSE]
+
+    ann <- data.frame(condition = meta$condition)
+    rownames(ann) <- rownames(meta)
+
+    pheatmap(mat_sig,
+             annotation_col = ann,
+             show_colnames = TRUE,
+             show_rownames = TRUE,
+             fontsize_row = 7,
+             main = paste0("Heatmap miRNA significativi - ", nm),
+             filename = file.path(this_dir, paste0("Heatmap_SIG_", nm, ".png")),
+             width = 9, height = 8)
+  }
+}
+
+############################
+# Comparative analysis across contrasts
+############################
+# 1) Summary table: number of DE miRNAs per contrast
+summary_df <- data.frame(
+  contrast = names(sig_sets),
+  n_sig = vapply(sig_sets, length, integer(1))
+)
+save_csv(summary_df, file.path(cmp_dir, "Summary_counts_SIG_per_contrast.csv"))
+
+# 2) Overlaps (pairwise + all three)
+all_three <- Reduce(intersect, sig_sets)
+pair_PB_DA  <- intersect(sig_sets$PB_vs_SANO,  sig_sets$DA_vs_SANO)
+pair_PB_PSO <- intersect(sig_sets$PB_vs_SANO,  sig_sets$PSO_vs_SANO)
+pair_DA_PSO <- intersect(sig_sets$DA_vs_SANO,  sig_sets$PSO_vs_SANO)
+
+overlaps <- list(
+  common_all_three = all_three,
+  common_PB_DA     = pair_PB_DA,
+  common_PB_PSO    = pair_PB_PSO,
+  common_DA_PSO    = pair_DA_PSO
+)
+
+# save overlap lists
+for (nm in names(overlaps)) {
+  df <- data.frame(miRNA = overlaps[[nm]])
+  save_csv(df, file.path(cmp_dir, paste0("Overlap_", nm, ".csv")))
+}
+
+# 3) Union list (any pathology vs SANO)
+union_all <- sort(unique(unlist(sig_sets)))
+save_csv(data.frame(miRNA = union_all), file.path(cmp_dir, "Union_all_pathologies_SIG.csv"))
+
+# 4) Presence/absence matrix for easy inspection
+presence <- data.frame(miRNA = union_all)
+for (cn in names(sig_sets)) {
+  presence[[cn]] <- presence$miRNA %in% sig_sets[[cn]]
+}
+save_csv(presence, file.path(cmp_dir, "PresenceAbsence_matrix_SIG.csv"))
+
+# Optional: UpSet plot (if package available)
+if (requireNamespace("UpSetR", quietly = TRUE)) {
+  library(UpSetR)
+  png(file.path(cmp_dir, "UpSet_SIG.png"), width = 1200, height = 800, res = 140)
+  UpSetR::upset(as.data.frame(presence[, -1, drop = FALSE]),
+                nsets = length(sig_sets),
+                order.by = "freq")
+  dev.off()
+}
+
+############################
+# Functional enrichment (miRNA -> targets -> pathways)
+############################
+# IMPORTANT:
+# Enrichment for miRNA requires mapping to target genes first.
+# This section uses multiMiR + clusterProfiler/ReactomePA if installed.
+# It can be slow and may need internet access to query databases.
+#
+# Output is produced per contrast (using significant miRNAs lists).
+############################
+run_enrichment <- TRUE
+
+if (run_enrichment &&
+    requireNamespace("multiMiR", quietly = TRUE) &&
+    requireNamespace("clusterProfiler", quietly = TRUE) &&
+    requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+
+  suppressPackageStartupMessages({
+    library(multiMiR)
+    library(clusterProfiler)
+    library(org.Hs.eg.db)
+  })
+
+  # helper: get targets from multiMiR (validated + predicted)
+  get_targets <- function(mirnas, validated_only = TRUE) {
+    if (length(mirnas) == 0) return(character(0))
+
+    # multiMiR expects miRNA names, can handle hsa-miR-xxx style.
+    # If yours are already hsa-miR..., ok. If not, you may need to add prefix.
+    res <- tryCatch(
+      {
+        if (validated_only) {
+          multiMiR::get_multimir(mirna = mirnas,
+                                 table = "validated",
+                                 summary = TRUE)
+        } else {
+          multiMiR::get_multimir(mirna = mirnas,
+                                 table = "all",
+                                 summary = TRUE)
+        }
+      },
+      error = function(e) NULL
+    )
+    if (is.null(res)) return(character(0))
+
+    df <- res@data
+    # target_symbol column can be present; otherwise try target_entrez
+    if ("target_symbol" %in% colnames(df)) {
+      unique(na.omit(df$target_symbol))
+    } else {
+      character(0)
+    }
+  }
+
+  # helper: pathway enrichment from gene symbols
+  enrich_pathways <- function(gene_symbols) {
+    gene_symbols <- unique(na.omit(gene_symbols))
+    if (length(gene_symbols) < 10) return(NULL)
+
+    entrez <- mapIds(org.Hs.eg.db,
+                     keys = gene_symbols,
+                     column = "ENTREZID",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+    entrez <- unique(na.omit(entrez))
+    if (length(entrez) < 10) return(NULL)
+
+    list(
+      GO_BP = enrichGO(gene = entrez,
+                       OrgDb = org.Hs.eg.db,
+                       keyType = "ENTREZID",
+                       ont = "BP",
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = 0.05,
+                       qvalueCutoff = 0.2,
+                       readable = TRUE),
+      KEGG  = enrichKEGG(gene = entrez,
+                         organism = "hsa",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.05)
+    )
+  }
+
+  for (nm in names(sig_sets)) {
+    this_dir <- make_dir(enr_dir, nm)
+
+    mirs <- sig_sets[[nm]]
+    # try validated targets (more conservative)
+    targets <- get_targets(mirs, validated_only = TRUE)
+    save_csv(data.frame(target_symbol = targets),
+             file.path(this_dir, paste0(nm, "_targets_validated_symbols.csv")))
+
+    enr <- enrich_pathways(targets)
+    if (is.null(enr)) next
+
+    # Save tables
+    if (!is.null(enr$GO_BP) && nrow(as.data.frame(enr$GO_BP)) > 0) {
+      save_csv(as.data.frame(enr$GO_BP),
+               file.path(this_dir, paste0(nm, "_GO_BP_enrichment.csv")))
+      png(file.path(this_dir, paste0(nm, "_GO_BP_dotplot.png")), width = 1200, height = 800, res = 140)
+      print(dotplot(enr$GO_BP, showCategory = 20) + ggtitle(paste0(nm, " - GO BP (targets)")))
+      dev.off()
+    }
+
+    if (!is.null(enr$KEGG) && nrow(as.data.frame(enr$KEGG)) > 0) {
+      save_csv(as.data.frame(enr$KEGG),
+               file.path(this_dir, paste0(nm, "_KEGG_enrichment.csv")))
+      png(file.path(this_dir, paste0(nm, "_KEGG_dotplot.png")), width = 1200, height = 800, res = 140)
+      print(dotplot(enr$KEGG, showCategory = 20) + ggtitle(paste0(nm, " - KEGG (targets)")))
+      dev.off()
+    }
+  }
+
+} else {
+  # write a short note in output folder so you remember why enrichment didn't run
+  note <- c(
+    "ENRICHMENT NON ESEGUITO.",
+    "Per fare arricchimento funzionale con miRNA serve: multiMiR + clusterProfiler + org.Hs.eg.db.",
+    "Installa (esempio):",
+    "  install.packages(c('BiocManager'))",
+    "  BiocManager::install(c('DESeq2','pheatmap','multiMiR','clusterProfiler','org.Hs.eg.db','UpSetR'))",
+    "",
+    "Poi rilancia lo script."
+  )
+  writeLines(note, file.path(enr_dir, "README_enrichment.txt"))
+}
+
+############################
+# Final: save session info
+############################
+writeLines(capture.output(sessionInfo()), file.path(outdir, "sessionInfo.txt"))
+
+cat("\nDONE ✅  Output in:", outdir, "\n")
